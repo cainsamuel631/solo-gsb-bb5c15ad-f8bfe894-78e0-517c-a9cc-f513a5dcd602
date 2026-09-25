@@ -50,6 +50,17 @@ let reprintBlobUrl = null;
 let reprintData = null;
 // 本次拼版使用的选项（缺页补印需按相同选项复用拼版方案）
 let lastImposeOptions = null;
+// 稿件标识：每次变更选中文件（含清空与选中非 PDF）时递增，
+// 使旧稿件上尚未返回的请求回调全部失效（防串稿）
+let fileToken = 0;
+// 各操作序号：每次发起对应操作时递增。回调只在「稿件未变且仍是
+// 最新一次该操作」时才更新界面与按钮；重新拼版会使旧拼版触发的
+// 报价/裁切/补印回调一并失效（见 clearResult）
+let preflightOpId = 0;
+let imposeOpId = 0;
+let quoteOpId = 0;
+let cuttingOpId = 0;
+let reprintOpId = 0;
 
 signatureModeInput.addEventListener('change', () => {
   maxSheetsField.hidden = !signatureModeInput.checked;
@@ -105,6 +116,10 @@ function clearResult() {
     URL.revokeObjectURL(resultBlobUrl);
     resultBlobUrl = null;
   }
+  // 拼版结果作废时，其下游在飞请求（报价/裁切/补印）的回调一并失效
+  quoteOpId += 1;
+  cuttingOpId += 1;
+  reprintOpId += 1;
   summaryEl.hidden = true;
   previewEl.hidden = true;
   sheetsEl.innerHTML = '';
@@ -131,6 +146,8 @@ function clearReport() {
 }
 
 function selectFile(file) {
+  // 换稿（含清空、选中非 PDF）即作废旧稿件上所有在飞请求的回调
+  fileToken += 1;
   clearResult();
   clearReport();
   if (!file) {
@@ -141,6 +158,11 @@ function selectFile(file) {
     return;
   }
   if (file.type && file.type !== 'application/pdf') {
+    // 非 PDF：清除此前选中的文件并禁用校验、拼版入口
+    selectedFile = null;
+    fileName.textContent = '';
+    imposeBtn.disabled = true;
+    preflightBtn.disabled = true;
     setStatus('请选择 PDF 文件', 'error');
     return;
   }
@@ -172,13 +194,19 @@ function escapeHtml(text) {
 }
 
 preflightBtn.addEventListener('click', async () => {
-  if (!selectedFile) return;
+  const file = selectedFile;
+  if (!file) return;
+  // 捕获当前稿件与本次操作标识：仅当回调时仍匹配才更新界面与按钮
+  const token = fileToken;
+  const opId = ++preflightOpId;
+  const isCurrent = () => token === fileToken && opId === preflightOpId;
+
   preflightBtn.disabled = true;
   imposeBtn.disabled = true;
   setStatus('正在执行印前校验，不会生成拼版文件…', 'info');
 
   const form = new FormData();
-  form.append('pdf', selectedFile);
+  form.append('pdf', file);
 
   try {
     const resp = await fetch('/api/preflight', { method: 'POST', body: form });
@@ -190,9 +218,11 @@ preflightBtn.addEventListener('click', async () => {
       } catch (_) { /* 非 JSON 错误响应，使用默认提示 */ }
       throw new Error(message);
     }
-    preflightReport = await resp.json();
-    renderReport(preflightReport);
-    const { summary } = preflightReport;
+    const report = await resp.json();
+    if (!isCurrent()) return; // 已换稿或已发起更新的校验：丢弃旧结果
+    preflightReport = report;
+    renderReport(report);
+    const { summary } = report;
     if (summary.error > 0) {
       setStatus(`校验完成：发现 ${summary.error} 个错误、${summary.warning} 个警告、`
         + `${summary.info} 个提示。仍可继续拼版，请先评估错误项。`, 'error');
@@ -202,10 +232,13 @@ preflightBtn.addEventListener('click', async () => {
       setStatus('校验完成：未发现印前问题，可以直接拼版。', 'info');
     }
   } catch (err) {
+    if (!isCurrent()) return;
     setStatus(err.message || '印前校验失败', 'error');
   } finally {
-    preflightBtn.disabled = false;
-    imposeBtn.disabled = false;
+    if (isCurrent()) {
+      preflightBtn.disabled = false;
+      imposeBtn.disabled = false;
+    }
   }
 });
 
@@ -375,7 +408,8 @@ dropzone.addEventListener('drop', (e) => {
 });
 
 imposeBtn.addEventListener('click', async () => {
-  if (!selectedFile) return;
+  const file = selectedFile;
+  if (!file) return;
 
   const useSignatures = signatureModeInput.checked;
   let maxSheets = null;
@@ -391,12 +425,17 @@ imposeBtn.addEventListener('click', async () => {
     if (paperThickness === null) return;
   }
 
+  // 捕获当前稿件与本次操作标识：仅当回调时仍匹配才更新界面与按钮
+  const token = fileToken;
+  const opId = ++imposeOpId;
+  const isCurrent = () => token === fileToken && opId === imposeOpId;
+
   imposeBtn.disabled = true;
   setStatus('正在拼版，请稍候…', 'info');
   clearResult();
 
   const form = new FormData();
-  form.append('pdf', selectedFile);
+  form.append('pdf', file);
   if (useSignatures) {
     form.append('signatureMode', 'on');
     form.append('maxSheetsPerSignature', String(maxSheets));
@@ -426,6 +465,7 @@ imposeBtn.addEventListener('click', async () => {
     const plan = JSON.parse(decodeURIComponent(planHeader));
 
     const blob = await resp.blob();
+    if (!isCurrent()) return; // 已换稿或已重新拼版：丢弃旧结果（不创建对象 URL）
     resultBlobUrl = URL.createObjectURL(blob);
 
     // 记录本次拼版选项，缺页补印按相同选项复用拼版方案
@@ -444,9 +484,10 @@ imposeBtn.addEventListener('click', async () => {
     requestQuote(plan);
     requestCutting(plan);
   } catch (err) {
+    if (!isCurrent()) return;
     setStatus(err.message || '拼版失败', 'error');
   } finally {
-    imposeBtn.disabled = false;
+    if (isCurrent()) imposeBtn.disabled = false;
   }
 });
 
@@ -1318,6 +1359,10 @@ function clearQuote() {
   quoteResultEl.innerHTML = '';
   quoteStatusEl.textContent = '';
   quoteStatusEl.className = 'status';
+  // 在飞报价请求的收尾不会恢复按钮（仅匹配操作才收尾），此处直接重置
+  quoteRefreshBtn.disabled = false;
+  quoteRefreshBtn.dataset.stale = '';
+  quoteRefreshBtn.classList.remove('stale');
 }
 
 /**
@@ -1335,6 +1380,12 @@ function markQuoteStale() {
 }
 
 async function requestQuote(plan) {
+  // 捕获当前稿件与本次操作标识：换稿、重新拼版或已有更新的报价请求时，
+  // 本次回调不再更新界面与按钮
+  const token = fileToken;
+  const opId = ++quoteOpId;
+  const isCurrent = () => token === fileToken && opId === quoteOpId;
+
   lastPlan = plan;
   quoteRefreshBtn.disabled = true;
   quoteRefreshBtn.dataset.stale = '';
@@ -1375,7 +1426,9 @@ async function requestQuote(plan) {
       } catch (_) { /* 使用默认提示 */ }
       throw new Error(message);
     }
-    quoteData = await resp.json();
+    const data = await resp.json();
+    if (!isCurrent()) return; // 已换稿或已有更新的报价：丢弃旧结果
+    quoteData = data;
     chosenOptionIndex = quoteData.selected ? quoteData.selected.index : null;
     renderQuoteResult();
     if (quoteData.feasible) {
@@ -1387,12 +1440,13 @@ async function requestQuote(plan) {
       quoteStatusEl.className = 'status error';
     }
   } catch (err) {
+    if (!isCurrent()) return;
     quoteData = null;
     quoteResultEl.hidden = true;
     quoteStatusEl.textContent = err.message || '报价失败';
     quoteStatusEl.className = 'status error';
   } finally {
-    quoteRefreshBtn.disabled = false;
+    if (isCurrent()) quoteRefreshBtn.disabled = false;
   }
 }
 
@@ -1604,6 +1658,12 @@ function markCuttingStale() {
 }
 
 async function requestCutting(plan) {
+  // 捕获当前稿件与本次操作标识：换稿、重新拼版或已有更新的裁切请求时，
+  // 本次回调不再更新界面与按钮
+  const token = fileToken;
+  const opId = ++cuttingOpId;
+  const isCurrent = () => token === fileToken && opId === cuttingOpId;
+
   cuttingBoxEl.hidden = false;
   cuttingResultEl.hidden = true;
   cuttingResultEl.innerHTML = '';
@@ -1649,7 +1709,9 @@ async function requestCutting(plan) {
       } catch (_) { /* 使用默认提示 */ }
       throw new Error(message);
     }
-    cuttingData = await resp.json();
+    const data = await resp.json();
+    if (!isCurrent()) return; // 已换稿或已有更新的裁切：丢弃旧结果
+    cuttingData = data;
     renderCuttingResult();
     if (cuttingData.feasible) {
       const rec = cuttingData.options.find((o) => o.index === cuttingData.recommended.index);
@@ -1662,11 +1724,12 @@ async function requestCutting(plan) {
       setCuttingStatus('维护的原纸均无法裁出该印张，见下方原因。', 'error');
     }
   } catch (err) {
+    if (!isCurrent()) return;
     cuttingData = null;
     cuttingResultEl.hidden = true;
     setCuttingStatus(err.message || '裁切计算失败', 'error');
   } finally {
-    cuttingCalcBtn.disabled = false;
+    if (isCurrent()) cuttingCalcBtn.disabled = false;
   }
 }
 
@@ -1964,6 +2027,8 @@ function clearReprint() {
   reprintStatusEl.textContent = '';
   reprintStatusEl.className = 'status';
   reprintPagesInput.classList.remove('invalid');
+  // 在飞补印请求的收尾不会恢复按钮（仅匹配操作才收尾），此处直接重置
+  reprintBtn.disabled = false;
   reprintDownloadBtn.disabled = true;
 }
 
@@ -2014,7 +2079,9 @@ reprintPagesInput.addEventListener('input', () => {
 });
 
 reprintBtn.addEventListener('click', async () => {
-  if (!selectedFile || !lastImposeOptions) return;
+  const file = selectedFile;
+  const imposeOptions = lastImposeOptions;
+  if (!file || !imposeOptions) return;
 
   const pagesValue = reprintPagesInput.value;
   if (!pagesValue || !pagesValue.trim()) {
@@ -2023,6 +2090,11 @@ reprintBtn.addEventListener('click', async () => {
     return;
   }
   reprintPagesInput.classList.remove('invalid');
+
+  // 捕获当前稿件与本次操作标识：仅当回调时仍匹配才更新界面与按钮
+  const token = fileToken;
+  const opId = ++reprintOpId;
+  const isCurrent = () => token === fileToken && opId === reprintOpId;
 
   reprintBtn.disabled = true;
   setReprintStatus('正在按本次拼版方案定位受损页并生成补印 PDF…', 'info');
@@ -2037,18 +2109,18 @@ reprintBtn.addEventListener('click', async () => {
   reprintDownloadBtn.disabled = true;
 
   const form = new FormData();
-  form.append('pdf', selectedFile);
+  form.append('pdf', file);
   form.append('pages', pagesValue.trim());
-  if (lastImposeOptions.signatureMode) {
+  if (imposeOptions.signatureMode) {
     form.append('signatureMode', 'on');
-    form.append('maxSheetsPerSignature', String(lastImposeOptions.maxSheetsPerSignature));
+    form.append('maxSheetsPerSignature', String(imposeOptions.maxSheetsPerSignature));
   }
-  if (lastImposeOptions.registrationMarks) {
+  if (imposeOptions.registrationMarks) {
     form.append('registrationMarks', 'on');
   }
-  if (lastImposeOptions.creepCompensation) {
+  if (imposeOptions.creepCompensation) {
     form.append('creepCompensation', 'on');
-    form.append('paperThicknessMm', String(lastImposeOptions.paperThicknessMm));
+    form.append('paperThicknessMm', String(imposeOptions.paperThicknessMm));
   }
 
   try {
@@ -2059,15 +2131,17 @@ reprintBtn.addEventListener('click', async () => {
         const data = await resp.json();
         if (data && data.error) message = data.error;
       } catch (_) { /* 非 JSON 错误响应，使用默认提示 */ }
-      if (resp.status === 400) reprintPagesInput.classList.add('invalid');
+      if (isCurrent() && resp.status === 400) reprintPagesInput.classList.add('invalid');
       throw new Error(message);
     }
 
     const planHeader = resp.headers.get('X-Reprint-Plan');
     if (!planHeader) throw new Error('响应缺少补印方案');
-    reprintData = JSON.parse(decodeURIComponent(planHeader));
+    const data = JSON.parse(decodeURIComponent(planHeader));
 
     const blob = await resp.blob();
+    if (!isCurrent()) return; // 已换稿或已重新补印：丢弃旧结果（不创建对象 URL）
+    reprintData = data;
     reprintBlobUrl = URL.createObjectURL(blob);
 
     renderReprintResult(reprintData);
@@ -2077,9 +2151,10 @@ reprintBtn.addEventListener('click', async () => {
       'info',
     );
   } catch (err) {
+    if (!isCurrent()) return;
     setReprintStatus(err.message || '补印失败', 'error');
   } finally {
-    reprintBtn.disabled = false;
+    if (isCurrent()) reprintBtn.disabled = false;
   }
 });
 
